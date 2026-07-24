@@ -20,6 +20,32 @@ function parseToolInput(raw: string): Record<string, unknown> {
   }
 }
 
+interface NormalizedUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+}
+
+// OpenAI's prompt_tokens INCLUDES cached tokens; Anthropic's input_tokens
+// EXCLUDES cache reads/writes and reports them in separate fields. Clients sum
+// all four fields to get the total, so cached tokens must be subtracted here
+// or they get counted twice.
+function normalizeOpenAIUsage(usage: Record<string, any> | null | undefined): NormalizedUsage {
+  const promptTokens = typeof usage?.prompt_tokens === "number" ? usage.prompt_tokens : 0
+  const completionTokens = typeof usage?.completion_tokens === "number" ? usage.completion_tokens : 0
+  const details = usage?.prompt_tokens_details
+  const cacheRead = typeof details?.cached_tokens === "number" ? details.cached_tokens : 0
+  const cacheWrite = typeof details?.cache_write_tokens === "number" ? details.cache_write_tokens : 0
+
+  return {
+    inputTokens: Math.max(0, promptTokens - cacheRead - cacheWrite),
+    outputTokens: completionTokens,
+    cacheReadInputTokens: cacheRead,
+    cacheCreationInputTokens: cacheWrite
+  }
+}
+
 export function mapStopReason(stopReason: string | null | undefined): AnthropicStopReason {
   switch (stopReason) {
     case "length":
@@ -63,6 +89,8 @@ export function convertOpenAINonStreamToAnthropic(
 
   content.push(...convertToolCalls(assistantMessage?.tool_calls))
 
+  const usage = normalizeOpenAIUsage(response.usage)
+
   return {
     id: response.id || `msg_${randomUUID().replace(/-/g, "")}`,
     type: "message",
@@ -72,41 +100,51 @@ export function convertOpenAINonStreamToAnthropic(
     stop_reason: mapStopReason(firstChoice?.finish_reason),
     stop_sequence: null,
     usage: {
-      input_tokens: response.usage?.prompt_tokens ?? 0,
-      output_tokens: response.usage?.completion_tokens ?? 0,
-      cache_read_input_tokens: response.usage?.prompt_tokens_details?.cached_tokens,
-      cache_creation_input_tokens: response.usage?.prompt_tokens_details?.cache_write_tokens
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      cache_read_input_tokens: usage.cacheReadInputTokens,
+      cache_creation_input_tokens: usage.cacheCreationInputTokens
     }
   }
 }
 
-interface ToolState {
-  blockIndex: number
+interface ToolIdentity {
   id: string
   name: string
-  started: boolean
-  closed: boolean
 }
+
+// Anthropic streams content blocks strictly sequentially: block N emits
+// content_block_stop before block N+1 emits content_block_start. Clients
+// (including Claude Code) rely on that ordering when they reconstruct the
+// message, so only one block may ever be open at a time.
+type OpenBlock =
+  | { kind: "text"; index: number }
+  | { kind: "thinking"; index: number }
+  | { kind: "tool"; index: number; openAiToolIndex: number }
 
 export class OpenAIStreamToAnthropic {
   private readonly messageId = `msg_${randomUUID().replace(/-/g, "")}`
   private readonly requestedModel: string
+  private readonly estimatedInputTokens?: number
   private stopReason: AnthropicStopReason = "end_turn"
-  private usage = {
-    input_tokens: 0,
-    output_tokens: 0
+  private usage: NormalizedUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0
   }
+  private promptUsageReported = false
+  private completionUsageReported = false
+  private emittedChars = 0
   private started = false
   private finalized = false
   private nextBlockIndex = 0
-  private textBlockIndex: number | null = null
-  private textBlockClosed = false
-  private thinkingBlockIndex: number | null = null
-  private thinkingBlockClosed = false
-  private readonly toolStates = new Map<number, ToolState>()
+  private openBlock: OpenBlock | null = null
+  private readonly toolIdentities = new Map<number, ToolIdentity>()
 
-  constructor(requestedModel: string) {
+  constructor(requestedModel: string, estimatedInputTokens?: number) {
     this.requestedModel = requestedModel
+    this.estimatedInputTokens = estimatedInputTokens
   }
 
   processChunk(chunk: Record<string, any>): AnthropicSseEvent[] {
@@ -118,17 +156,27 @@ export class OpenAIStreamToAnthropic {
     const finishReason = choice?.finish_reason
 
     if (chunk.usage) {
-      this.usage.input_tokens = chunk.usage.prompt_tokens ?? this.usage.input_tokens
-      this.usage.output_tokens = chunk.usage.completion_tokens ?? this.usage.output_tokens
+      const normalized = normalizeOpenAIUsage(chunk.usage)
+      if (typeof chunk.usage.prompt_tokens === "number" && chunk.usage.prompt_tokens > 0) {
+        this.promptUsageReported = true
+        this.usage.inputTokens = normalized.inputTokens
+        this.usage.cacheReadInputTokens = normalized.cacheReadInputTokens
+        this.usage.cacheCreationInputTokens = normalized.cacheCreationInputTokens
+      }
+      if (typeof chunk.usage.completion_tokens === "number" && chunk.usage.completion_tokens > 0) {
+        this.completionUsageReported = true
+        this.usage.outputTokens = normalized.outputTokens
+      }
+    }
+
+    // Reasoning precedes the answer, so thinking blocks must open before text.
+    const reasoningText = this.readReasoningDelta(delta)
+    if (reasoningText) {
+      events.push(...this.handleThinkingDelta(reasoningText))
     }
 
     if (typeof delta.content === "string" && delta.content.length > 0) {
       events.push(...this.handleTextDelta(delta.content))
-    }
-
-    const reasoningText = this.readReasoningDelta(delta)
-    if (reasoningText) {
-      events.push(...this.handleThinkingDelta(reasoningText))
     }
 
     if (Array.isArray(delta.tool_calls)) {
@@ -137,9 +185,7 @@ export class OpenAIStreamToAnthropic {
 
     if (finishReason) {
       this.stopReason = mapStopReason(finishReason)
-      if (finishReason === "tool_calls") {
-        events.push(...this.closeOpenToolBlocks())
-      }
+      events.push(...this.closeOpenBlock())
     }
 
     return events
@@ -151,9 +197,20 @@ export class OpenAIStreamToAnthropic {
     }
     this.finalized = true
 
+    // Estimated fallbacks keep token accounting meaningful for upstreams that
+    // never report usage; real reported values always win.
+    const inputTokens = this.promptUsageReported
+      ? this.usage.inputTokens
+      : (this.estimatedInputTokens ?? 0)
+    const outputTokens = this.completionUsageReported
+      ? this.usage.outputTokens
+      : this.emittedChars > 0
+        ? Math.max(1, Math.ceil(this.emittedChars / 4))
+        : 0
+
     const events: AnthropicSseEvent[] = []
     events.push(...this.ensureMessageStart())
-    events.push(...this.closeRemainingBlocks())
+    events.push(...this.closeOpenBlock())
     events.push({
       event: "message_delta",
       data: {
@@ -163,7 +220,10 @@ export class OpenAIStreamToAnthropic {
           stop_sequence: null
         },
         usage: {
-          output_tokens: this.usage.output_tokens
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          cache_read_input_tokens: this.usage.cacheReadInputTokens,
+          cache_creation_input_tokens: this.usage.cacheCreationInputTokens
         }
       }
     })
@@ -193,9 +253,15 @@ export class OpenAIStreamToAnthropic {
             role: "assistant",
             model: this.requestedModel,
             content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            // Zeros, not estimates: real usage arrives only in the upstream's
+            // final chunk and is reported via message_delta. Clients merge that
+            // into the message, and several (including Claude Code) prefer the
+            // merged final values only when the message_start snapshot reads 0.
             usage: {
-              input_tokens: this.usage.input_tokens,
-              output_tokens: this.usage.output_tokens
+              input_tokens: 0,
+              output_tokens: 0
             }
           }
         }
@@ -203,15 +269,36 @@ export class OpenAIStreamToAnthropic {
     ]
   }
 
+  private closeOpenBlock(): AnthropicSseEvent[] {
+    if (!this.openBlock) {
+      return []
+    }
+
+    const index = this.openBlock.index
+    this.openBlock = null
+    return [
+      {
+        event: "content_block_stop",
+        data: {
+          type: "content_block_stop",
+          index
+        }
+      }
+    ]
+  }
+
   private handleTextDelta(text: string): AnthropicSseEvent[] {
     const events: AnthropicSseEvent[] = []
-    if (this.textBlockIndex === null) {
-      this.textBlockIndex = this.nextBlockIndex++
+    this.emittedChars += text.length
+
+    if (this.openBlock?.kind !== "text") {
+      events.push(...this.closeOpenBlock())
+      this.openBlock = { kind: "text", index: this.nextBlockIndex++ }
       events.push({
         event: "content_block_start",
         data: {
           type: "content_block_start",
-          index: this.textBlockIndex,
+          index: this.openBlock.index,
           content_block: {
             type: "text",
             text: ""
@@ -220,19 +307,17 @@ export class OpenAIStreamToAnthropic {
       })
     }
 
-    if (!this.textBlockClosed) {
-      events.push({
-        event: "content_block_delta",
-        data: {
-          type: "content_block_delta",
-          index: this.textBlockIndex,
-          delta: {
-            type: "text_delta",
-            text
-          }
+    events.push({
+      event: "content_block_delta",
+      data: {
+        type: "content_block_delta",
+        index: this.openBlock.index,
+        delta: {
+          type: "text_delta",
+          text
         }
-      })
-    }
+      }
+    })
 
     return events
   }
@@ -251,13 +336,16 @@ export class OpenAIStreamToAnthropic {
 
   private handleThinkingDelta(thinking: string): AnthropicSseEvent[] {
     const events: AnthropicSseEvent[] = []
-    if (this.thinkingBlockIndex === null) {
-      this.thinkingBlockIndex = this.nextBlockIndex++
+    this.emittedChars += thinking.length
+
+    if (this.openBlock?.kind !== "thinking") {
+      events.push(...this.closeOpenBlock())
+      this.openBlock = { kind: "thinking", index: this.nextBlockIndex++ }
       events.push({
         event: "content_block_start",
         data: {
           type: "content_block_start",
-          index: this.thinkingBlockIndex,
+          index: this.openBlock.index,
           content_block: {
             type: "thinking",
             thinking: ""
@@ -266,19 +354,18 @@ export class OpenAIStreamToAnthropic {
       })
     }
 
-    if (!this.thinkingBlockClosed) {
-      events.push({
-        event: "content_block_delta",
-        data: {
-          type: "content_block_delta",
-          index: this.thinkingBlockIndex,
-          delta: {
-            type: "thinking_delta",
-            thinking
-          }
+    events.push({
+      event: "content_block_delta",
+      data: {
+        type: "content_block_delta",
+        index: this.openBlock.index,
+        delta: {
+          type: "thinking_delta",
+          thinking
         }
-      })
-    }
+      }
+    })
+
     return events
   }
 
@@ -287,37 +374,35 @@ export class OpenAIStreamToAnthropic {
 
     for (const toolCall of toolCalls) {
       const openAiToolIndex = Number(toolCall.index ?? 0)
-      let state = this.toolStates.get(openAiToolIndex)
+      let identity = this.toolIdentities.get(openAiToolIndex)
 
-      if (!state) {
-        state = {
-          blockIndex: this.nextBlockIndex++,
+      if (!identity) {
+        identity = {
           id: toolCall.id || `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-          name: toolCall.function?.name || "tool",
-          started: false,
-          closed: false
+          name: toolCall.function?.name || "tool"
         }
-        this.toolStates.set(openAiToolIndex, state)
+        this.toolIdentities.set(openAiToolIndex, identity)
+      } else {
+        if (toolCall.id && identity.id.startsWith("toolu_")) {
+          identity.id = toolCall.id
+        }
+        if (toolCall.function?.name && identity.name === "tool") {
+          identity.name = toolCall.function.name
+        }
       }
 
-      if (toolCall.id && state.id.startsWith("toolu_")) {
-        state.id = toolCall.id
-      }
-      if (toolCall.function?.name && state.name === "tool") {
-        state.name = toolCall.function.name
-      }
-
-      if (!state.started) {
-        state.started = true
+      if (this.openBlock?.kind !== "tool" || this.openBlock.openAiToolIndex !== openAiToolIndex) {
+        events.push(...this.closeOpenBlock())
+        this.openBlock = { kind: "tool", index: this.nextBlockIndex++, openAiToolIndex }
         events.push({
           event: "content_block_start",
           data: {
             type: "content_block_start",
-            index: state.blockIndex,
+            index: this.openBlock.index,
             content_block: {
               type: "tool_use",
-              id: state.id,
-              name: state.name,
+              id: identity.id,
+              name: identity.name,
               input: {}
             }
           }
@@ -326,11 +411,12 @@ export class OpenAIStreamToAnthropic {
 
       const argsDelta = toolCall.function?.arguments
       if (typeof argsDelta === "string" && argsDelta.length > 0) {
+        this.emittedChars += argsDelta.length
         events.push({
           event: "content_block_delta",
           data: {
             type: "content_block_delta",
-            index: state.blockIndex,
+            index: this.openBlock.index,
             delta: {
               type: "input_json_delta",
               partial_json: argsDelta
@@ -340,52 +426,6 @@ export class OpenAIStreamToAnthropic {
       }
     }
 
-    return events
-  }
-
-  private closeOpenToolBlocks(): AnthropicSseEvent[] {
-    const events: AnthropicSseEvent[] = []
-    for (const state of this.toolStates.values()) {
-      if (state.started && !state.closed) {
-        state.closed = true
-        events.push({
-          event: "content_block_stop",
-          data: {
-            type: "content_block_stop",
-            index: state.blockIndex
-          }
-        })
-      }
-    }
-    return events
-  }
-
-  private closeRemainingBlocks(): AnthropicSseEvent[] {
-    const events: AnthropicSseEvent[] = []
-
-    if (this.textBlockIndex !== null && !this.textBlockClosed) {
-      this.textBlockClosed = true
-      events.push({
-        event: "content_block_stop",
-        data: {
-          type: "content_block_stop",
-          index: this.textBlockIndex
-        }
-      })
-    }
-
-    if (this.thinkingBlockIndex !== null && !this.thinkingBlockClosed) {
-      this.thinkingBlockClosed = true
-      events.push({
-        event: "content_block_stop",
-        data: {
-          type: "content_block_stop",
-          index: this.thinkingBlockIndex
-        }
-      })
-    }
-
-    events.push(...this.closeOpenToolBlocks())
     return events
   }
 }

@@ -6,6 +6,7 @@ import { OpenAIStreamToAnthropic, convertOpenAINonStreamToAnthropic } from "../a
 import type { AnthropicMessagesRequest } from "../types/contracts.js"
 import { GatewayError, toAnthropicStreamErrorEvent, toGatewayError } from "../utils/errors.js"
 import { createSseParserState, formatSseEvent, parseSseChunk } from "../utils/sse.js"
+import { estimateRequestInputTokens } from "../utils/token_estimate.js"
 
 const anthropicMessageSchema = z.object({
   model: z.string().min(1),
@@ -39,7 +40,7 @@ async function streamAnthropicResponse(
     throw new GatewayError(502, "Upstream stream did not return a body", "api_error")
   }
 
-  const translator = new OpenAIStreamToAnthropic(payload.model)
+  const translator = new OpenAIStreamToAnthropic(payload.model, estimateRequestInputTokens(payload))
   const reader = upstreamResponse.body.getReader()
   const decoder = new TextDecoder()
   let parserState = createSseParserState()
