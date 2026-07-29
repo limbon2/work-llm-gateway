@@ -108,24 +108,21 @@ export function convertOpenAINonStreamToAnthropic(
   }
 }
 
-interface ToolIdentity {
+interface PendingToolCall {
   id: string
   name: string
+  args: string
 }
 
 // Anthropic streams content blocks strictly sequentially: block N emits
 // content_block_stop before block N+1 emits content_block_start. Clients
 // (including Claude Code) rely on that ordering when they reconstruct the
 // message, so only one block may ever be open at a time.
-type OpenBlock =
-  | { kind: "text"; index: number }
-  | { kind: "thinking"; index: number }
-  | { kind: "tool"; index: number; openAiToolIndex: number }
+type OpenBlock = { kind: "text" | "thinking"; index: number }
 
 export class OpenAIStreamToAnthropic {
   private readonly messageId = `msg_${randomUUID().replace(/-/g, "")}`
   private readonly requestedModel: string
-  private readonly estimatedInputTokens?: number
   private stopReason: AnthropicStopReason = "end_turn"
   private usage: NormalizedUsage = {
     inputTokens: 0,
@@ -133,18 +130,16 @@ export class OpenAIStreamToAnthropic {
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 0
   }
-  private promptUsageReported = false
   private completionUsageReported = false
   private emittedChars = 0
   private started = false
   private finalized = false
   private nextBlockIndex = 0
   private openBlock: OpenBlock | null = null
-  private readonly toolIdentities = new Map<number, ToolIdentity>()
+  private readonly pendingToolCalls = new Map<number, PendingToolCall>()
 
-  constructor(requestedModel: string, estimatedInputTokens?: number) {
+  constructor(requestedModel: string) {
     this.requestedModel = requestedModel
-    this.estimatedInputTokens = estimatedInputTokens
   }
 
   processChunk(chunk: Record<string, any>): AnthropicSseEvent[] {
@@ -158,7 +153,6 @@ export class OpenAIStreamToAnthropic {
     if (chunk.usage) {
       const normalized = normalizeOpenAIUsage(chunk.usage)
       if (typeof chunk.usage.prompt_tokens === "number" && chunk.usage.prompt_tokens > 0) {
-        this.promptUsageReported = true
         this.usage.inputTokens = normalized.inputTokens
         this.usage.cacheReadInputTokens = normalized.cacheReadInputTokens
         this.usage.cacheCreationInputTokens = normalized.cacheCreationInputTokens
@@ -180,12 +174,14 @@ export class OpenAIStreamToAnthropic {
     }
 
     if (Array.isArray(delta.tool_calls)) {
-      events.push(...this.handleToolCallDeltas(delta.tool_calls))
+      this.accumulateToolCallDeltas(delta.tool_calls)
     }
 
+    // Latch the stop reason but do not close anything here: some upstreams set
+    // finish_reason on many chunks (not just the last), and closing per chunk
+    // would fragment the message into one block per delta.
     if (finishReason) {
       this.stopReason = mapStopReason(finishReason)
-      events.push(...this.closeOpenBlock())
     }
 
     return events
@@ -197,11 +193,10 @@ export class OpenAIStreamToAnthropic {
     }
     this.finalized = true
 
-    // Estimated fallbacks keep token accounting meaningful for upstreams that
-    // never report usage; real reported values always win.
-    const inputTokens = this.promptUsageReported
-      ? this.usage.inputTokens
-      : (this.estimatedInputTokens ?? 0)
+    // Char-based fallback keeps output accounting meaningful for upstreams
+    // that never report usage; reported values always win. Input tokens are
+    // deliberately NOT estimated: overstating them pressures client context
+    // heuristics (auto-compact, final-turn forcing) into cutting agents short.
     const outputTokens = this.completionUsageReported
       ? this.usage.outputTokens
       : this.emittedChars > 0
@@ -211,6 +206,7 @@ export class OpenAIStreamToAnthropic {
     const events: AnthropicSseEvent[] = []
     events.push(...this.ensureMessageStart())
     events.push(...this.closeOpenBlock())
+    events.push(...this.emitPendingToolBlocks())
     events.push({
       event: "message_delta",
       data: {
@@ -220,7 +216,7 @@ export class OpenAIStreamToAnthropic {
           stop_sequence: null
         },
         usage: {
-          input_tokens: inputTokens,
+          input_tokens: this.usage.inputTokens,
           output_tokens: outputTokens,
           cache_read_input_tokens: this.usage.cacheReadInputTokens,
           cache_creation_input_tokens: this.usage.cacheCreationInputTokens
@@ -369,63 +365,81 @@ export class OpenAIStreamToAnthropic {
     return events
   }
 
-  private handleToolCallDeltas(toolCalls: Array<Record<string, any>>): AnthropicSseEvent[] {
-    const events: AnthropicSseEvent[] = []
-
+  // Tool calls are buffered and emitted as complete blocks in finalize().
+  // Upstreams may interleave deltas of different tool-call indices or repeat
+  // finish_reason chunks; emitting each tool block atomically (start, full
+  // arguments, stop) is immune to both, at the cost of the arguments not
+  // streaming incrementally — clients only act on the completed message anyway.
+  private accumulateToolCallDeltas(toolCalls: Array<Record<string, any>>): void {
     for (const toolCall of toolCalls) {
       const openAiToolIndex = Number(toolCall.index ?? 0)
-      let identity = this.toolIdentities.get(openAiToolIndex)
+      let pending = this.pendingToolCalls.get(openAiToolIndex)
 
-      if (!identity) {
-        identity = {
+      if (!pending) {
+        pending = {
           id: toolCall.id || `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-          name: toolCall.function?.name || "tool"
+          name: toolCall.function?.name || "tool",
+          args: ""
         }
-        this.toolIdentities.set(openAiToolIndex, identity)
+        this.pendingToolCalls.set(openAiToolIndex, pending)
       } else {
-        if (toolCall.id && identity.id.startsWith("toolu_")) {
-          identity.id = toolCall.id
+        if (toolCall.id && pending.id.startsWith("toolu_")) {
+          pending.id = toolCall.id
         }
-        if (toolCall.function?.name && identity.name === "tool") {
-          identity.name = toolCall.function.name
+        if (toolCall.function?.name && pending.name === "tool") {
+          pending.name = toolCall.function.name
         }
-      }
-
-      if (this.openBlock?.kind !== "tool" || this.openBlock.openAiToolIndex !== openAiToolIndex) {
-        events.push(...this.closeOpenBlock())
-        this.openBlock = { kind: "tool", index: this.nextBlockIndex++, openAiToolIndex }
-        events.push({
-          event: "content_block_start",
-          data: {
-            type: "content_block_start",
-            index: this.openBlock.index,
-            content_block: {
-              type: "tool_use",
-              id: identity.id,
-              name: identity.name,
-              input: {}
-            }
-          }
-        })
       }
 
       const argsDelta = toolCall.function?.arguments
       if (typeof argsDelta === "string" && argsDelta.length > 0) {
         this.emittedChars += argsDelta.length
+        pending.args += argsDelta
+      }
+    }
+  }
+
+  private emitPendingToolBlocks(): AnthropicSseEvent[] {
+    const events: AnthropicSseEvent[] = []
+
+    for (const pending of this.pendingToolCalls.values()) {
+      const index = this.nextBlockIndex++
+      events.push({
+        event: "content_block_start",
+        data: {
+          type: "content_block_start",
+          index,
+          content_block: {
+            type: "tool_use",
+            id: pending.id,
+            name: pending.name,
+            input: {}
+          }
+        }
+      })
+      if (pending.args.length > 0) {
         events.push({
           event: "content_block_delta",
           data: {
             type: "content_block_delta",
-            index: this.openBlock.index,
+            index,
             delta: {
               type: "input_json_delta",
-              partial_json: argsDelta
+              partial_json: pending.args
             }
           }
         })
       }
+      events.push({
+        event: "content_block_stop",
+        data: {
+          type: "content_block_stop",
+          index
+        }
+      })
     }
 
+    this.pendingToolCalls.clear()
     return events
   }
 }

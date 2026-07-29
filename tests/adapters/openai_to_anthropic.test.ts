@@ -193,7 +193,7 @@ describe("OpenAIStreamToAnthropic", () => {
   })
 
   it("reports full usage in message_delta with Anthropic cache semantics", () => {
-    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5", 999)
+    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5")
     const events = [
       ...translator.processChunk({
         choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: "stop" }]
@@ -221,8 +221,8 @@ describe("OpenAIStreamToAnthropic", () => {
     })
   })
 
-  it("falls back to estimates when the upstream never reports usage", () => {
-    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5", 500)
+  it("estimates only output tokens when the upstream never reports usage", () => {
+    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5")
     const events = [
       ...translator.processChunk({
         choices: [{ index: 0, delta: { content: "twelve chars" }, finish_reason: "stop" }]
@@ -232,11 +232,91 @@ describe("OpenAIStreamToAnthropic", () => {
 
     const messageDelta = events.find((event) => event.event === "message_delta")
     expect((messageDelta?.data as any).usage).toEqual({
-      input_tokens: 500,
+      input_tokens: 0,
       output_tokens: 3,
       cache_read_input_tokens: 0,
       cache_creation_input_tokens: 0
     })
+  })
+
+  it("tolerates upstreams that set finish_reason on every chunk", () => {
+    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5")
+    const events = [
+      ...translator.processChunk({
+        choices: [{ index: 0, delta: { content: "Hel" }, finish_reason: "stop" }]
+      }),
+      ...translator.processChunk({
+        choices: [{ index: 0, delta: { content: "lo " }, finish_reason: "stop" }]
+      }),
+      ...translator.processChunk({
+        choices: [{ index: 0, delta: { content: "there" }, finish_reason: "stop" }]
+      }),
+      ...translator.finalize()
+    ]
+
+    // The message must stay a single text block; per-chunk finish_reason must
+    // not fragment it.
+    const starts = events.filter((event) => event.event === "content_block_start")
+    expect(starts).toHaveLength(1)
+    const text = events
+      .filter((event) => event.event === "content_block_delta")
+      .map((event) => (event.data as any).delta.text)
+      .join("")
+    expect(text).toBe("Hello there")
+    expect((events.find((e) => e.event === "message_delta")?.data as any).delta.stop_reason).toBe("end_turn")
+  })
+
+  it("keeps tool call arguments intact when tool-call indices interleave", () => {
+    const translator = new OpenAIStreamToAnthropic("claude-sonnet-4-5")
+    const events = [
+      ...translator.processChunk({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, id: "call_a", type: "function", function: { name: "sum", arguments: "{\"a\":1," } },
+                { index: 1, id: "call_b", type: "function", function: { name: "max", arguments: "{\"xs\":" } }
+              ]
+            },
+            finish_reason: null
+          }
+        ]
+      }),
+      ...translator.processChunk({
+        choices: [
+          {
+            index: 0,
+            delta: { tool_calls: [{ index: 0, function: { arguments: "\"b\":2}" } }] },
+            finish_reason: null
+          }
+        ]
+      }),
+      ...translator.processChunk({
+        choices: [
+          {
+            index: 0,
+            delta: { tool_calls: [{ index: 1, function: { arguments: "[1,2]}" } }] },
+            finish_reason: "tool_calls"
+          }
+        ]
+      }),
+      ...translator.finalize()
+    ]
+
+    const starts = events.filter((event) => event.event === "content_block_start")
+    expect(starts).toHaveLength(2)
+    expect((starts[0].data as any).content_block).toMatchObject({ id: "call_a", name: "sum" })
+    expect((starts[1].data as any).content_block).toMatchObject({ id: "call_b", name: "max" })
+
+    const argsByIndex = new Map<number, string>()
+    for (const event of events) {
+      if (event.event !== "content_block_delta") continue
+      const data = event.data as any
+      argsByIndex.set(data.index, (argsByIndex.get(data.index) ?? "") + data.delta.partial_json)
+    }
+    expect(JSON.parse(argsByIndex.get((starts[0].data as any).index)!)).toEqual({ a: 1, b: 2 })
+    expect(JSON.parse(argsByIndex.get((starts[1].data as any).index)!)).toEqual({ xs: [1, 2] })
   })
 
   it("does not double-count cached tokens in non-stream responses", () => {
