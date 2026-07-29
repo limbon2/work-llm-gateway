@@ -1,6 +1,6 @@
 import { GatewayConfig } from "../config/env.js"
 import { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "../types/contracts.js"
-import { GatewayError } from "../utils/errors.js"
+import { GatewayError, normalizeContextOverflowMessage } from "../utils/errors.js"
 
 export interface UpstreamClient {
   createChatCompletion(payload: OpenAIChatCompletionRequest): Promise<OpenAIChatCompletionResponse>
@@ -93,6 +93,7 @@ export class UpstreamOpenAIClient implements UpstreamClient {
   private async toUpstreamError(response: Response): Promise<GatewayError> {
     const fallbackMessage = `Upstream error: ${response.status} ${response.statusText}`
     let message = fallbackMessage
+    let errorCode: string | undefined
 
     try {
       const bodyText = await response.text()
@@ -101,15 +102,21 @@ export class UpstreamOpenAIClient implements UpstreamClient {
       }
 
       const parsed = JSON.parse(bodyText) as Record<string, unknown>
-      const extractedMessage =
-        (parsed.error as { message?: string } | undefined)?.message ??
-        (parsed.message as string | undefined) ??
-        bodyText
+      const errorBody = parsed.error as { message?: string; code?: string } | undefined
+      const extractedMessage = errorBody?.message ?? (parsed.message as string | undefined) ?? bodyText
       if (typeof extractedMessage === "string") {
         message = extractedMessage
       }
+      if (typeof errorBody?.code === "string") {
+        errorCode = errorBody.code
+      }
     } catch {
       // Ignore parse failures and keep fallback message.
+    }
+
+    const contextOverflowMessage = normalizeContextOverflowMessage(response.status, message, errorCode)
+    if (contextOverflowMessage) {
+      return new GatewayError(400, contextOverflowMessage, "invalid_request_error")
     }
 
     if (response.status === 429) {
