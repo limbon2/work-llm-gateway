@@ -12,6 +12,12 @@ import {
   OpenAIToolDefinition
 } from "../types/contracts.js"
 import { GatewayError } from "../utils/errors.js"
+import { stripClaudeCodeTokenReminders } from "../utils/token_reminders.js"
+
+function sanitizedText(text: string): string | undefined {
+  const sanitized = stripClaudeCodeTokenReminders(text)
+  return sanitized.trim().length > 0 ? sanitized : undefined
+}
 
 function normalizeModel(
   model: string,
@@ -27,13 +33,14 @@ function systemToOpenAIMessage(system?: string | AnthropicMessageContentBlock[])
   }
 
   if (typeof system === "string") {
-    return [{ role: "system", content: system }]
+    const content = sanitizedText(system)
+    return content ? [{ role: "system", content }] : []
   }
 
   const textBlocks = system
     .filter((block) => block.type === "text")
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .filter(Boolean)
+    .map((block) => (block.type === "text" ? sanitizedText(block.text) : undefined))
+    .filter((text): text is string => text !== undefined)
 
   if (textBlocks.length === 0) {
     return []
@@ -44,12 +51,13 @@ function systemToOpenAIMessage(system?: string | AnthropicMessageContentBlock[])
 
 function toolResultContentToText(block: AnthropicToolResultBlock): string {
   if (typeof block.content === "string") {
-    return block.content
+    return stripClaudeCodeTokenReminders(block.content)
   }
 
   return block.content
     .filter((part) => part.type === "text")
-    .map((part) => part.text)
+    .map((part) => sanitizedText(part.text))
+    .filter((text): text is string => text !== undefined)
     .join("\n")
 }
 
@@ -92,9 +100,13 @@ function convertUserContentBlocks(blocks: AnthropicMessageContentBlock[]): OpenA
 
   for (const block of blocks) {
     switch (block.type) {
-      case "text":
-        pendingParts.push({ type: "text", text: block.text })
+      case "text": {
+        const text = sanitizedText(block.text)
+        if (text) {
+          pendingParts.push({ type: "text", text })
+        }
         break
+      }
       case "image":
         pendingParts.push(imageBlockToPart(block))
         break
@@ -132,9 +144,13 @@ function convertAssistantContentBlocks(blocks: AnthropicMessageContentBlock[]): 
 
   for (const block of blocks) {
     switch (block.type) {
-      case "text":
-        textParts.push(block.text)
+      case "text": {
+        const text = sanitizedText(block.text)
+        if (text) {
+          textParts.push(text)
+        }
         break
+      }
       case "tool_use":
         toolCalls.push({
           id: block.id,
@@ -171,7 +187,8 @@ function convertAssistantContentBlocks(blocks: AnthropicMessageContentBlock[]): 
 
 function convertMessage(message: AnthropicMessage): OpenAIChatMessage[] {
   if (typeof message.content === "string") {
-    return [{ role: message.role, content: message.content }]
+    const content = sanitizedText(message.content)
+    return content ? [{ role: message.role, content }] : []
   }
 
   if (message.role === "user") {

@@ -95,6 +95,54 @@ describe("gateway routes", () => {
     expect(body.content[0]).toEqual({ type: "text", text: "Hello from upstream" })
   })
 
+  it("removes Claude Code token reminders before calling upstream", async () => {
+    let capturedPayload: OpenAIChatCompletionRequest | undefined
+    const stubClient = createStubClient()
+    const upstreamClient: UpstreamClient = {
+      ...stubClient,
+      async createChatCompletion(payload) {
+        capturedPayload = payload
+        return stubClient.createChatCompletion(payload)
+      }
+    }
+    const app = createApp(baseConfig(), { upstreamClient })
+    appsToClose.push(app)
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      payload: {
+        model: "claude-sonnet-4-5",
+        system: [
+          { type: "text", text: "Be helpful." },
+          { type: "text", text: "<total_tokens>15000000 tokens left</total_tokens>" }
+        ],
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: [
+                  "<system-reminder>",
+                  "<total_tokens>14999990 tokens left</total_tokens>",
+                  "</system-reminder>"
+                ].join("\n")
+              },
+              { type: "text", text: "Say hi" }
+            ]
+          }
+        ]
+      }
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(capturedPayload?.messages).toEqual([
+      { role: "system", content: "Be helpful." },
+      { role: "user", content: "Say hi" }
+    ])
+  })
+
   it("accepts message bodies larger than Fastify's default one MiB limit", async () => {
     const app = createApp(baseConfig(), { upstreamClient: createStubClient() })
     appsToClose.push(app)
@@ -175,7 +223,7 @@ describe("gateway routes", () => {
 
     const tokenResponse = await app.inject({
       method: "POST",
-      url: "/v1/messages/count_tokens",
+      url: "/v1/messages/count_tokens?beta=true",
       payload: {
         model: "claude-sonnet-4-5",
         system: "You are helpful",
@@ -184,6 +232,21 @@ describe("gateway routes", () => {
     })
     expect(tokenResponse.statusCode).toBe(200)
     expect(tokenResponse.json().input_tokens).toBeGreaterThan(0)
+
+    const tokenResponseWithReminder = await app.inject({
+      method: "POST",
+      url: "/v1/messages/count_tokens?beta=true",
+      payload: {
+        model: "claude-sonnet-4-5",
+        system: [
+          { type: "text", text: "You are helpful" },
+          { type: "text", text: "<total_tokens>15000000 tokens left</total_tokens>" }
+        ],
+        messages: [{ role: "user", content: "Count these tokens." }]
+      }
+    })
+    expect(tokenResponseWithReminder.statusCode).toBe(200)
+    expect(tokenResponseWithReminder.json().input_tokens).toBe(tokenResponse.json().input_tokens)
   })
 
   it("enforces optional gateway API keys", async () => {

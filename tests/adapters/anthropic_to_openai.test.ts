@@ -106,4 +106,97 @@ describe("convertAnthropicRequestToOpenAI", () => {
 
     expect(converted.model).toBe("gpt-4.1")
   })
+
+  it("does not forward Claude Code token reminders to the model", () => {
+    const request: AnthropicMessagesRequest = {
+      model: "any-model",
+      system: [
+        { type: "text", text: "Follow the user instructions." },
+        { type: "text", text: "<total_tokens>15000000 tokens left</total_tokens>" },
+        { type: "text", text: "<system-reminder>Keep the tests green.</system-reminder>" }
+      ],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_1",
+              name: "read_file",
+              input: { path: "README.md" }
+            }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_1",
+              content: [
+                { type: "text", text: "file contents" },
+                {
+                  type: "text",
+                  text: [
+                    "<system-reminder>",
+                    "Token usage: 10/200000; 199990 remaining",
+                    "</system-reminder>"
+                  ].join("\n")
+                }
+              ]
+            },
+            {
+              type: "text",
+              text: [
+                "<system-reminder>",
+                "<total_tokens>14999990 tokens left</total_tokens>",
+                "</system-reminder>"
+              ].join("\n")
+            },
+            { type: "text", text: "Continue with the result." }
+          ]
+        },
+        {
+          role: "user",
+          content: "What changed?\n<total_tokens>Infinite tokens left</total_tokens>"
+        },
+        {
+          role: "user",
+          content: "<total_tokens>5000000 tokens left</total_tokens>"
+        }
+      ]
+    }
+
+    const converted = convertAnthropicRequestToOpenAI(request, {})
+    const serializedMessages = JSON.stringify(converted.messages)
+
+    expect(serializedMessages).not.toContain("total_tokens")
+    expect(serializedMessages).not.toContain("Token usage:")
+    expect(converted.messages).toEqual([
+      {
+        role: "system",
+        content: [
+          "Follow the user instructions.",
+          "<system-reminder>Keep the tests green.</system-reminder>"
+        ].join("\n")
+      },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: JSON.stringify({ path: "README.md" })
+            }
+          }
+        ]
+      },
+      { role: "tool", tool_call_id: "call_1", content: "file contents" },
+      { role: "user", content: "Continue with the result." },
+      { role: "user", content: "What changed?\n" }
+    ])
+  })
 })

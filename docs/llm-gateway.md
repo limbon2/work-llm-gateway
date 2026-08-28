@@ -63,6 +63,10 @@ npm run dev
 Configure Claude Code to use this gateway URL as its Anthropic-compatible
 endpoint.
 
+The gateway removes Claude Code's standalone `<total_tokens>... tokens left</total_tokens>`
+reminders before forwarding prompts. These are client bookkeeping, not user or model content.
+They can also be disabled at the client with `CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off`.
+
 ## Quick check
 
 ```bash

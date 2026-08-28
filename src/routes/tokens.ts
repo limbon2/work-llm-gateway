@@ -21,7 +21,10 @@ export function registerTokenRoute(app: FastifyInstance): void {
 
     const textParts = [
       systemPromptToText(payload.system as any),
-      ...payload.messages.map((message) => `${message.role}: ${messageToText(message as any)}`)
+      ...payload.messages.map((message) => {
+        const text = messageToText(message as any)
+        return text.trim().length > 0 ? `${message.role}: ${text}` : ""
+      })
     ].filter(Boolean)
 
     const combined = textParts.join("\n")

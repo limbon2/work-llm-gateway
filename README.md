@@ -165,7 +165,12 @@ claude
 Notes:
 1. If `GATEWAY_API_KEYS` is configured, `ANTHROPIC_AUTH_TOKEN` must match one configured key.
 2. If `GATEWAY_API_KEYS` is empty, token validation is disabled by this gateway.
-3. `ANTHROPIC_MODEL` controls the model Claude Code requests; the gateway can still remap or force upstream model via `MODEL_ALIAS_JSON` or `UPSTREAM_MODEL`.
+3. `ANTHROPIC_MODEL` controls the model Claude Code requests; the gateway can still remap or
+   force the upstream model via `MODEL_ALIAS_JSON` or `UPSTREAM_MODEL`.
+4. Claude Code may inject `<total_tokens>... tokens left</total_tokens>` bookkeeping into
+   prompts. The gateway removes these standalone counters before forwarding requests upstream.
+   To stop Claude Code from generating them too, set
+   `CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off` in the Claude Code environment.
 
 ## Troubleshooting
 
