@@ -39,6 +39,7 @@ function readGatewayKeyFromHeaders(headers: Record<string, unknown>): string | u
 
 export function createApp(config: GatewayConfig, options: CreateAppOptions = {}): FastifyInstance {
   const app = Fastify({
+    bodyLimit: config.requestBodyLimitBytes,
     logger: {
       level: config.logLevel
     }

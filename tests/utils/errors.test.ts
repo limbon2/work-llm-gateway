@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 
 import { UpstreamOpenAIClient } from "../../src/clients/upstream_openai.js"
-import { GatewayError, normalizeContextOverflowMessage } from "../../src/utils/errors.js"
+import { GatewayError, normalizeContextOverflowMessage, toGatewayError } from "../../src/utils/errors.js"
 
 // Claude Code's actual detection logic (extracted from the CLI bundle): the
 // substring check gates recovery, the regex feeds the compaction size hints.
@@ -68,12 +68,39 @@ describe("normalizeContextOverflowMessage", () => {
   })
 })
 
+describe("toGatewayError", () => {
+  it("preserves Fastify's request-body-too-large status", () => {
+    const fastifyError = Object.assign(new Error("Request body is too large"), {
+      code: "FST_ERR_CTP_BODY_TOO_LARGE",
+      statusCode: 413
+    })
+
+    const gatewayError = toGatewayError(fastifyError)
+
+    expect(gatewayError.statusCode).toBe(413)
+    expect(gatewayError.errorType).toBe("request_too_large")
+    expect(gatewayError.message).toBe("Request body is too large")
+  })
+})
+
 describe("UpstreamOpenAIClient context overflow mapping", () => {
   let server: Server
   let port: number
 
   beforeAll(async () => {
     server = createServer((req, res) => {
+      if (req.url?.startsWith("/request-too-large/")) {
+        res.writeHead(413, { "content-type": "application/json" })
+        res.end(
+          JSON.stringify({
+            error: {
+              message: "Request body exceeds the provider's byte limit"
+            }
+          })
+        )
+        return
+      }
+
       res.writeHead(400, { "content-type": "application/json" })
       res.end(
         JSON.stringify({
@@ -102,6 +129,7 @@ describe("UpstreamOpenAIClient context overflow mapping", () => {
       port: 0,
       host: "",
       requestTimeoutMs: 5000,
+      requestBodyLimitBytes: 32 * 1024 * 1024,
       gatewayApiKeys: [],
       modelAliases: {},
       logLevel: "error"
@@ -120,5 +148,32 @@ describe("UpstreamOpenAIClient context overflow mapping", () => {
     expect(gatewayError.errorType).toBe("invalid_request_error")
     expect(claudeCodeDetectsPtl(gatewayError.message)).toBe(true)
     expect(claudeCodeParsesPtl(gatewayError.message)).toEqual({ actual: 270100, limit: 262144 })
+  })
+
+  it("preserves an upstream byte-size 413 as request_too_large", async () => {
+    const client = new UpstreamOpenAIClient({
+      upstreamBaseUrl: `http://127.0.0.1:${port}/request-too-large`,
+      upstreamApiKey: "",
+      port: 0,
+      host: "",
+      requestTimeoutMs: 5000,
+      requestBodyLimitBytes: 32 * 1024 * 1024,
+      gatewayApiKeys: [],
+      modelAliases: {},
+      logLevel: "error"
+    })
+
+    let caught: unknown
+    try {
+      await client.createChatCompletion({ model: "m", messages: [{ role: "user", content: "hi" }] })
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(GatewayError)
+    const gatewayError = caught as GatewayError
+    expect(gatewayError.statusCode).toBe(413)
+    expect(gatewayError.errorType).toBe("request_too_large")
+    expect(gatewayError.message).toBe("Request body exceeds the provider's byte limit")
   })
 })

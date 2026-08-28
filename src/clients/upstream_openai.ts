@@ -125,6 +125,9 @@ export class UpstreamOpenAIClient implements UpstreamClient {
     if (response.status === 401) {
       return new GatewayError(401, message, "authentication_error")
     }
+    if (response.status === 413) {
+      return new GatewayError(413, message, "request_too_large")
+    }
     if (response.status >= 400 && response.status < 500) {
       return new GatewayError(response.status, message, "invalid_request_error")
     }

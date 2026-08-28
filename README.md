@@ -42,6 +42,7 @@ UPSTREAM_MODEL=
 PORT=8787
 HOST=0.0.0.0
 REQUEST_TIMEOUT_MS=60000
+REQUEST_BODY_LIMIT_BYTES=33554432
 GATEWAY_API_KEYS=
 MODEL_ALIAS_JSON={}
 LOG_LEVEL=info
@@ -68,7 +69,10 @@ The gateway auto-loads:
 5. `GATEWAY_API_KEYS`:
    - Optional comma-separated list
    - If set, incoming requests must include one key via `Authorization: Bearer ...` or `x-api-key`
-6. `PORT`, `HOST`, `REQUEST_TIMEOUT_MS`, `LOG_LEVEL`:
+6. `REQUEST_BODY_LIMIT_BYTES`:
+   - Maximum accepted request body size in bytes
+   - Defaults to 32 MiB (`33554432`)
+7. `PORT`, `HOST`, `REQUEST_TIMEOUT_MS`, `LOG_LEVEL`:
    - Runtime settings
 
 Model resolution precedence:
@@ -175,3 +179,6 @@ Notes:
    - Use `UPSTREAM_MODEL` or `MODEL_ALIAS_JSON` to map to a valid upstream model
 4. Empty `/v1/models`:
    - Upstream may not expose `/models`, or auth/key is invalid
+5. `Request body is too large`:
+   - Increase `REQUEST_BODY_LIMIT_BYTES` if requests legitimately exceed the 32 MiB default
+   - Requests above the configured limit return HTTP 413 instead of HTTP 500

@@ -2,6 +2,7 @@ import { config as loadDotEnv } from "dotenv"
 import { z } from "zod"
 
 const logLevels = ["fatal", "error", "warn", "info", "debug", "trace"] as const
+const defaultRequestBodyLimitBytes = 32 * 1024 * 1024
 
 // Load environment files in this order:
 // 1) .env
@@ -16,6 +17,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(8787),
   HOST: z.string().default("0.0.0.0"),
   REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  REQUEST_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(defaultRequestBodyLimitBytes),
   GATEWAY_API_KEYS: z.string().optional(),
   MODEL_ALIAS_JSON: z.string().optional(),
   LOG_LEVEL: z.enum(logLevels).default("info")
@@ -28,6 +30,7 @@ export interface GatewayConfig {
   port: number
   host: string
   requestTimeoutMs: number
+  requestBodyLimitBytes: number
   gatewayApiKeys: string[]
   modelAliases: Record<string, string>
   logLevel: (typeof logLevels)[number]
@@ -80,6 +83,7 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env): GatewayConfi
     port: parsed.PORT,
     host: parsed.HOST,
     requestTimeoutMs: parsed.REQUEST_TIMEOUT_MS,
+    requestBodyLimitBytes: parsed.REQUEST_BODY_LIMIT_BYTES,
     gatewayApiKeys: parseApiKeys(parsed.GATEWAY_API_KEYS),
     modelAliases: parseModelAliases(parsed.MODEL_ALIAS_JSON),
     logLevel: parsed.LOG_LEVEL

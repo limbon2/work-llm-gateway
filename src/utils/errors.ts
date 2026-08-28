@@ -6,6 +6,7 @@ type AnthropicErrorType =
   | "invalid_request_error"
   | "authentication_error"
   | "permission_error"
+  | "request_too_large"
   | "rate_limit_error"
   | "api_error"
 
@@ -14,11 +15,12 @@ const statusToErrorType: Record<number, AnthropicErrorType> = {
   401: "authentication_error",
   403: "permission_error",
   404: "invalid_request_error",
+  413: "request_too_large",
   429: "rate_limit_error"
 }
 
 function defaultErrorType(status: number): AnthropicErrorType {
-  return statusToErrorType[status] ?? "api_error"
+  return statusToErrorType[status] ?? (status >= 400 && status < 500 ? "invalid_request_error" : "api_error")
 }
 
 export class GatewayError extends Error {
@@ -112,6 +114,16 @@ export function toGatewayError(error: unknown): GatewayError {
   }
 
   if (error instanceof Error) {
+    const statusCode = (error as Error & { statusCode?: unknown }).statusCode
+    if (
+      typeof statusCode === "number" &&
+      Number.isInteger(statusCode) &&
+      statusCode >= 400 &&
+      statusCode <= 599
+    ) {
+      return new GatewayError(statusCode, error.message)
+    }
+
     return new GatewayError(500, error.message, "api_error")
   }
 

@@ -12,6 +12,7 @@ function baseConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     port: 8787,
     host: "127.0.0.1",
     requestTimeoutMs: 60_000,
+    requestBodyLimitBytes: 32 * 1024 * 1024,
     gatewayApiKeys: [],
     modelAliases: {
       "claude-sonnet-4-5": "gpt-4o-mini"
@@ -92,6 +93,50 @@ describe("gateway routes", () => {
     expect(body.type).toBe("message")
     expect(body.model).toBe("claude-sonnet-4-5")
     expect(body.content[0]).toEqual({ type: "text", text: "Hello from upstream" })
+  })
+
+  it("accepts message bodies larger than Fastify's default one MiB limit", async () => {
+    const app = createApp(baseConfig(), { upstreamClient: createStubClient() })
+    appsToClose.push(app)
+
+    const largeMessage = "x".repeat(1_048_576)
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      payload: {
+        model: "claude-sonnet-4-5",
+        max_tokens: 256,
+        messages: [{ role: "user", content: largeMessage }]
+      }
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().content[0]).toEqual({ type: "text", text: "Hello from upstream" })
+  })
+
+  it("returns 413 when a message exceeds the configured body limit", async () => {
+    const app = createApp(baseConfig({ requestBodyLimitBytes: 1024 }), {
+      upstreamClient: createStubClient()
+    })
+    appsToClose.push(app)
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      payload: {
+        model: "claude-sonnet-4-5",
+        messages: [{ role: "user", content: "x".repeat(1024) }]
+      }
+    })
+
+    expect(response.statusCode).toBe(413)
+    expect(response.json()).toEqual({
+      type: "error",
+      error: {
+        type: "request_too_large",
+        message: "Request body is too large"
+      }
+    })
   })
 
   it("handles streaming /v1/messages", async () => {

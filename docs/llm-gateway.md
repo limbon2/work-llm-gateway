@@ -23,6 +23,7 @@ Recommended:
 - `UPSTREAM_API_KEY`
 - `UPSTREAM_MODEL` to force one upstream model for all requests.
 - `MODEL_ALIAS_JSON` to map Anthropic model IDs to upstream IDs.
+- `REQUEST_BODY_LIMIT_BYTES` to override the 32 MiB maximum incoming request size.
 
 The gateway automatically loads:
 
