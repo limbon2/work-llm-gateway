@@ -24,7 +24,8 @@ const anthropicMessageSchema = z.object({
 async function streamAnthropicResponse(
   app: FastifyInstance,
   payload: AnthropicMessagesRequest,
-  reply: FastifyReply
+  reply: FastifyReply,
+  gatewayRequestId: string
 ): Promise<void> {
   const openAiPayload = convertAnthropicRequestToOpenAI(
     payload,
@@ -34,7 +35,9 @@ async function streamAnthropicResponse(
   openAiPayload.stream = true
   openAiPayload.stream_options = { include_usage: true }
 
-  const upstreamResponse = await app.upstreamClient.streamChatCompletion(openAiPayload)
+  const upstreamResponse = await app.upstreamClient.streamChatCompletion(openAiPayload, {
+    gatewayRequestId
+  })
   if (!upstreamResponse.body) {
     throw new GatewayError(502, "Upstream stream did not return a body", "api_error")
   }
@@ -99,7 +102,7 @@ export function registerMessagesRoute(app: FastifyInstance): void {
     const payload = anthropicMessageSchema.parse(request.body) as AnthropicMessagesRequest
 
     if (payload.stream) {
-      await streamAnthropicResponse(app, payload, reply)
+      await streamAnthropicResponse(app, payload, reply, request.id)
       return reply
     }
 
@@ -108,7 +111,9 @@ export function registerMessagesRoute(app: FastifyInstance): void {
       app.gatewayConfig.modelAliases,
       app.gatewayConfig.upstreamModel
     )
-    const upstreamResponse = await app.upstreamClient.createChatCompletion(openAiPayload)
+    const upstreamResponse = await app.upstreamClient.createChatCompletion(openAiPayload, {
+      gatewayRequestId: request.id
+    })
     const anthropicResponse = convertOpenAINonStreamToAnthropic(upstreamResponse, payload.model)
     return reply.send(anthropicResponse)
   })

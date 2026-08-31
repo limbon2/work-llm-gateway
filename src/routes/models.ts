@@ -19,8 +19,10 @@ function mapModels(ids: string[]): ModelListResponse {
 }
 
 export function registerModelsRoute(app: FastifyInstance): void {
-  app.get("/v1/models", async (_request, reply) => {
-    const upstreamModels = await app.upstreamClient.listModels()
+  app.get("/v1/models", async (request, reply) => {
+    const upstreamModels = await app.upstreamClient.listModels({
+      gatewayRequestId: request.id
+    })
     const aliasModels = Object.keys(app.gatewayConfig.modelAliases)
 
     const allIds = [...new Set([...aliasModels, ...upstreamModels])]

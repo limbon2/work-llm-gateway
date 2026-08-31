@@ -46,7 +46,10 @@ export function createApp(config: GatewayConfig, options: CreateAppOptions = {})
   })
 
   app.decorate("gatewayConfig", config)
-  app.decorate("upstreamClient", options.upstreamClient ?? new UpstreamOpenAIClient(config))
+  app.decorate(
+    "upstreamClient",
+    options.upstreamClient ?? new UpstreamOpenAIClient(config, app.log)
+  )
 
   app.addHook("onRequest", async (request) => {
     const path = request.url.split("?")[0]

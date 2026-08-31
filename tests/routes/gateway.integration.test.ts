@@ -24,6 +24,9 @@ function baseConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
 
 function createStubClient(): UpstreamClient {
   return {
+    async checkConnectivity() {
+      return { statusCode: 200 }
+    },
     async createChatCompletion(_payload: OpenAIChatCompletionRequest): Promise<OpenAIChatCompletionResponse> {
       return {
         id: "chatcmpl-test",
@@ -282,6 +285,9 @@ describe("gateway routes", () => {
   it("forces configured upstream model", async () => {
     let capturedPayload: OpenAIChatCompletionRequest | undefined
     const upstreamClient: UpstreamClient = {
+      async checkConnectivity() {
+        return { statusCode: 200 }
+      },
       async createChatCompletion(payload: OpenAIChatCompletionRequest): Promise<OpenAIChatCompletionResponse> {
         capturedPayload = payload
         return {

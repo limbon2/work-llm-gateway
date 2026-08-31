@@ -95,6 +95,10 @@ npm run build
 npm run start
 ```
 
+At launch, the gateway makes an authenticated `GET /models` request to the configured
+`UPSTREAM_BASE_URL` before opening its listening socket. Startup fails if the provider cannot
+be reached, TLS setup fails, the request times out, or the provider rejects the check.
+
 Checks:
 
 ```bash
@@ -180,6 +184,9 @@ Notes:
 2. Upstream timeout:
    - Increase `REQUEST_TIMEOUT_MS`
    - Verify `UPSTREAM_BASE_URL` reachability
+   - Inspect the `Upstream provider request failed` log entry. Its `networkError` field
+     includes nested Node.js causes such as `ENOTFOUND`, `ECONNREFUSED`, the failed syscall,
+     host/address, and port.
 3. Model not found upstream:
    - Use `UPSTREAM_MODEL` or `MODEL_ALIAS_JSON` to map to a valid upstream model
 4. Empty `/v1/models`:
@@ -187,3 +194,8 @@ Notes:
 5. `Request body is too large`:
    - Increase `REQUEST_BODY_LIMIT_BYTES` if requests legitimately exceed the 32 MiB default
    - Requests above the configured limit return HTTP 413 instead of HTTP 500
+
+Every provider call emits structured start and completion/failure logs. They include
+correlation IDs, operation, sanitized provider URL, HTTP method/status, timeout, and elapsed
+time. Request bodies, API keys, authorization headers, and URL credentials/query values are
+not logged.
