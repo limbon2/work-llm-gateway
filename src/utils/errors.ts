@@ -16,18 +16,29 @@ const statusToErrorType: Record<number, AnthropicErrorType> = {
   403: "permission_error",
   404: "invalid_request_error",
   413: "request_too_large",
-  429: "rate_limit_error"
+  429: "rate_limit_error",
 }
 
 function defaultErrorType(status: number): AnthropicErrorType {
-  return statusToErrorType[status] ?? (status >= 400 && status < 500 ? "invalid_request_error" : "api_error")
+  return (
+    statusToErrorType[status] ??
+    (status >= 400 && status < 500 ? "invalid_request_error" : "api_error")
+  )
 }
 
 export class GatewayError extends Error {
   readonly statusCode: number
   readonly errorType: AnthropicErrorType
+  upstreamCode?: string
+  retryAt?: number
+  resetAt?: number
+  upstreamStatus?: number
 
-  constructor(statusCode: number, message: string, errorType: AnthropicErrorType = defaultErrorType(statusCode)) {
+  constructor(
+    statusCode: number,
+    message: string,
+    errorType: AnthropicErrorType = defaultErrorType(statusCode),
+  ) {
     super(message)
     this.name = "GatewayError"
     this.statusCode = statusCode
@@ -42,11 +53,14 @@ const contextOverflowPatterns: RegExp[] = [
   /context (?:window|length|limit).{0,60}(?:exceed|too (?:long|large)|overflow)/i,
   /input is too long/i,
   /prompt is too long/i,
-  /too many tokens/i
+  /too many tokens/i,
 ]
 
 // [limit, actual] or [actual, limit] extraction attempts, most specific first.
-const contextNumberPatterns: Array<{ pattern: RegExp; order: "actual-first" | "limit-first" }> = [
+const contextNumberPatterns: Array<{
+  pattern: RegExp
+  order: "actual-first" | "limit-first"
+}> = [
   // Anthropic shape: "prompt is too long: 210000 tokens > 200000 maximum"
   { pattern: /(\d[\d,]*)\s*tokens?\s*>\s*(\d[\d,]*)/i, order: "actual-first" },
   // OpenAI/vLLM shape: "This model's maximum context length is 128000 tokens.
@@ -54,14 +68,14 @@ const contextNumberPatterns: Array<{ pattern: RegExp; order: "actual-first" | "l
   {
     pattern:
       /maximum context length is (\d[\d,]*) tokens?[\s\S]{0,200}?(?:resulted in|requested|submitted)\s*(?:approximately\s*)?(\d[\d,]*)/i,
-    order: "limit-first"
+    order: "limit-first",
   },
   // Generic: "context window of 32768 tokens ... requested 40000 tokens"
   {
     pattern:
       /context (?:window|length|limit) (?:is |of )?(?:only )?(\d[\d,]*)[\s\S]{0,200}?(?:got|received|requested|resulted in|input(?: was)?)\s*(?:approximately\s*)?(\d[\d,]*)/i,
-    order: "limit-first"
-  }
+    order: "limit-first",
+  },
 ]
 
 function parseTokenCount(raw: string): number {
@@ -77,7 +91,7 @@ function parseTokenCount(raw: string): number {
 export function normalizeContextOverflowMessage(
   status: number,
   message: string,
-  errorCode?: string
+  errorCode?: string,
 ): string | undefined {
   if (status !== 400 && status !== 413) {
     return undefined
@@ -99,8 +113,14 @@ export function normalizeContextOverflowMessage(
     }
     const first = parseTokenCount(match[1])
     const second = parseTokenCount(match[2])
-    const [actual, limit] = order === "actual-first" ? [first, second] : [second, first]
-    if (Number.isFinite(actual) && Number.isFinite(limit) && actual > 0 && limit > 0) {
+    const [actual, limit] =
+      order === "actual-first" ? [first, second] : [second, first]
+    if (
+      Number.isFinite(actual) &&
+      Number.isFinite(limit) &&
+      actual > 0 &&
+      limit > 0
+    ) {
       return `prompt is too long: ${actual} tokens > ${limit} maximum${upstreamNote}`
     }
   }
@@ -130,26 +150,38 @@ export function toGatewayError(error: unknown): GatewayError {
   return new GatewayError(500, "Unknown server error", "api_error")
 }
 
-export function toAnthropicErrorResponse(error: GatewayError): AnthropicErrorResponse {
+export function toAnthropicErrorResponse(
+  error: GatewayError,
+): AnthropicErrorResponse {
   return {
     type: "error",
     error: {
       type: error.errorType,
-      message: error.message
-    }
+      message: error.message,
+      ...(error.upstreamCode ? { code: error.upstreamCode } : {}),
+      ...(error.retryAt ? { retry_at: error.retryAt } : {}),
+      ...(error.resetAt ? { reset_at: error.resetAt } : {}),
+      ...(error.upstreamStatus
+        ? { upstream_status: error.upstreamStatus }
+        : {}),
+    },
   }
 }
 
-export function sendAnthropicError(reply: FastifyReply, error: GatewayError): FastifyReply {
+export function sendAnthropicError(
+  reply: FastifyReply,
+  error: GatewayError,
+): FastifyReply {
+  if (error.retryAt)
+    reply.header(
+      "Retry-After",
+      Math.max(0, Math.ceil((error.retryAt - Date.now()) / 1000)),
+    )
   return reply.code(error.statusCode).send(toAnthropicErrorResponse(error))
 }
 
-export function toAnthropicStreamErrorEvent(error: GatewayError): Record<string, unknown> {
-  return {
-    type: "error",
-    error: {
-      type: error.errorType,
-      message: error.message
-    }
-  }
+export function toAnthropicStreamErrorEvent(
+  error: GatewayError,
+): Record<string, unknown> {
+  return toAnthropicErrorResponse(error) as unknown as Record<string, unknown>
 }

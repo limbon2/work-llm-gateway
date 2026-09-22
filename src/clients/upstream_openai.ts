@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto"
 
 import { GatewayConfig } from "../config/env.js"
-import { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "../types/contracts.js"
-import { GatewayError, normalizeContextOverflowMessage } from "../utils/errors.js"
+import {
+  OpenAIChatCompletionRequest,
+  OpenAIChatCompletionResponse,
+} from "../types/contracts.js"
+import {
+  GatewayError,
+  normalizeContextOverflowMessage,
+} from "../utils/errors.js"
 import { sanitizeUrl } from "../utils/logging.js"
 
 export interface UpstreamRequestContext {
@@ -17,11 +23,11 @@ export interface UpstreamClient {
   checkConnectivity(): Promise<UpstreamConnectivityResult>
   createChatCompletion(
     payload: OpenAIChatCompletionRequest,
-    context?: UpstreamRequestContext
+    context?: UpstreamRequestContext,
   ): Promise<OpenAIChatCompletionResponse>
   streamChatCompletion(
     payload: OpenAIChatCompletionRequest,
-    context?: UpstreamRequestContext
+    context?: UpstreamRequestContext,
   ): Promise<Response>
   listModels(context?: UpstreamRequestContext): Promise<string[]>
 }
@@ -33,7 +39,11 @@ export interface UpstreamLogger {
 }
 
 interface RequestLogContext extends UpstreamRequestContext {
-  operation: "startup_check" | "chat_completion" | "stream_chat_completion" | "list_models"
+  operation:
+    | "startup_check"
+    | "chat_completion"
+    | "stream_chat_completion"
+    | "list_models"
   model?: string
 }
 
@@ -51,20 +61,25 @@ interface ErrorDetails {
 const silentLogger: UpstreamLogger = {
   info: () => undefined,
   warn: () => undefined,
-  error: () => undefined
+  error: () => undefined,
 }
 
-function readString(record: Record<string, unknown>, key: string): string | undefined {
+function readString(
+  record: Record<string, unknown>,
+  key: string,
+): string | undefined {
   const value = record[key]
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
 
 function readStringOrNumber(
   record: Record<string, unknown>,
-  key: string
+  key: string,
 ): string | number | undefined {
   const value = record[key]
-  return typeof value === "string" || typeof value === "number" ? value : undefined
+  return typeof value === "string" || typeof value === "number"
+    ? value
+    : undefined
 }
 
 function errorDetails(error: unknown): ErrorDetails {
@@ -78,15 +93,21 @@ function errorDetails(error: unknown): ErrorDetails {
       syscall: readString(record, "syscall"),
       address: readString(record, "address"),
       hostname: readString(record, "hostname"),
-      port: readStringOrNumber(record, "port")
+      port: readStringOrNumber(record, "port"),
     }
   }
 
   return { message: String(error) }
 }
 
-function flattenErrorDetails(error: unknown, seen = new Set<unknown>()): ErrorDetails[] {
-  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+function flattenErrorDetails(
+  error: unknown,
+  seen = new Set<unknown>(),
+): ErrorDetails[] {
+  if (
+    (typeof error === "object" && error !== null) ||
+    typeof error === "function"
+  ) {
     if (seen.has(error)) {
       return []
     }
@@ -114,7 +135,9 @@ function flattenErrorDetails(error: unknown, seen = new Set<unknown>()): ErrorDe
 }
 
 function describeNetworkFailure(details: ErrorDetails[]): string {
-  const actionable = details.filter((detail) => detail.code || detail.message !== "fetch failed")
+  const actionable = details.filter(
+    (detail) => detail.code || detail.message !== "fetch failed",
+  )
   const selected = actionable.length > 0 ? actionable : details
   const descriptions = selected.map((detail) => {
     const metadata = [
@@ -122,10 +145,12 @@ function describeNetworkFailure(details: ErrorDetails[]): string {
       detail.syscall ? `syscall=${detail.syscall}` : undefined,
       detail.hostname ? `hostname=${detail.hostname}` : undefined,
       detail.address ? `address=${detail.address}` : undefined,
-      detail.port !== undefined ? `port=${detail.port}` : undefined
+      detail.port !== undefined ? `port=${detail.port}` : undefined,
     ].filter((part): part is string => !!part)
 
-    return metadata.length > 0 ? `${detail.message} (${metadata.join(", ")})` : detail.message
+    return metadata.length > 0
+      ? `${detail.message} (${metadata.join(", ")})`
+      : detail.message
   })
 
   return [...new Set(descriptions)].slice(0, 3).join("; caused by: ")
@@ -150,10 +175,10 @@ export class UpstreamOpenAIClient implements UpstreamClient {
       {
         method: "GET",
         headers: this.defaultHeaders({
-          Accept: "application/json"
-        })
+          Accept: "application/json",
+        }),
       },
-      { operation: "startup_check" }
+      { operation: "startup_check" },
     )
 
     await response.body?.cancel()
@@ -162,7 +187,7 @@ export class UpstreamOpenAIClient implements UpstreamClient {
 
   async createChatCompletion(
     payload: OpenAIChatCompletionRequest,
-    context: UpstreamRequestContext = {}
+    context: UpstreamRequestContext = {},
   ): Promise<OpenAIChatCompletionResponse> {
     const response = await this.request(
       "/chat/completions",
@@ -170,19 +195,43 @@ export class UpstreamOpenAIClient implements UpstreamClient {
         method: "POST",
         headers: this.defaultHeaders({
           "Content-Type": "application/json",
-          Accept: "application/json"
+          Accept: "application/json",
         }),
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       },
-      { ...context, operation: "chat_completion", model: payload.model }
+      { ...context, operation: "chat_completion", model: payload.model },
     )
 
-    return (await response.json()) as OpenAIChatCompletionResponse
+    // The header timeout has already finished. Bound non-streaming body reads too.
+    const reader = response.body?.getReader()
+    if (!reader)
+      throw new GatewayError(502, "Upstream returned no response body")
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    try {
+      timer = setTimeout(() => {
+        timedOut = true
+        void reader.cancel().catch(() => {})
+      }, this.timeoutMs)
+      const decoder = new TextDecoder()
+      let body = ""
+      while (true) {
+        const chunk = await reader.read()
+        if (timedOut)
+          throw new GatewayError(504, "Upstream response body timed out")
+        if (chunk.done) break
+        body += decoder.decode(chunk.value, { stream: true })
+      }
+      return JSON.parse(body + decoder.decode()) as OpenAIChatCompletionResponse
+    } finally {
+      clearTimeout(timer)
+      reader.releaseLock()
+    }
   }
 
   async streamChatCompletion(
     payload: OpenAIChatCompletionRequest,
-    context: UpstreamRequestContext = {}
+    context: UpstreamRequestContext = {},
   ): Promise<Response> {
     return this.request(
       "/chat/completions",
@@ -190,11 +239,11 @@ export class UpstreamOpenAIClient implements UpstreamClient {
         method: "POST",
         headers: this.defaultHeaders({
           "Content-Type": "application/json",
-          Accept: "text/event-stream"
+          Accept: "text/event-stream",
         }),
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       },
-      { ...context, operation: "stream_chat_completion", model: payload.model }
+      { ...context, operation: "stream_chat_completion", model: payload.model },
     )
   }
 
@@ -204,21 +253,23 @@ export class UpstreamOpenAIClient implements UpstreamClient {
       {
         method: "GET",
         headers: this.defaultHeaders({
-          Accept: "application/json"
-        })
+          Accept: "application/json",
+        }),
       },
-      { ...context, operation: "list_models" }
+      { ...context, operation: "list_models" },
     )
 
     const payload = (await response.json()) as { data?: Array<{ id?: string }> }
-    const ids = payload.data?.map((item) => item.id).filter((id): id is string => !!id) ?? []
+    const ids =
+      payload.data?.map((item) => item.id).filter((id): id is string => !!id) ??
+      []
     return [...new Set(ids)]
   }
 
   private async request(
     path: string,
     init: RequestInit,
-    context: RequestLogContext
+    context: RequestLogContext,
   ): Promise<Response> {
     const controller = new AbortController()
     let timedOut = false
@@ -246,7 +297,7 @@ export class UpstreamOpenAIClient implements UpstreamClient {
       method,
       url: logUrl,
       model: context.model,
-      timeoutMs: this.timeoutMs
+      timeoutMs: this.timeoutMs,
     }
 
     this.logger.info(logContext, "Sending request to upstream provider")
@@ -254,7 +305,7 @@ export class UpstreamOpenAIClient implements UpstreamClient {
     try {
       const response = await fetch(url, {
         ...init,
-        signal: controller.signal
+        signal: controller.signal,
       })
       const durationMs = Math.round(performance.now() - startedAt)
 
@@ -266,9 +317,9 @@ export class UpstreamOpenAIClient implements UpstreamClient {
             durationMs,
             statusCode: response.status,
             statusText: response.statusText,
-            upstreamErrorType: upstreamError.errorType
+            upstreamErrorType: upstreamError.errorType,
           },
-          "Upstream provider returned an error response"
+          "Upstream provider returned an error response",
         )
         throw upstreamError
       }
@@ -278,9 +329,9 @@ export class UpstreamOpenAIClient implements UpstreamClient {
           ...logContext,
           durationMs,
           statusCode: response.status,
-          statusText: response.statusText
+          statusText: response.statusText,
         },
-        "Upstream provider request completed"
+        "Upstream provider request completed",
       )
       return response
     } catch (error) {
@@ -296,14 +347,14 @@ export class UpstreamOpenAIClient implements UpstreamClient {
           {
             ...logContext,
             durationMs,
-            networkError: details
+            networkError: details,
           },
-          "Upstream provider request timed out"
+          "Upstream provider request timed out",
         )
         throw new GatewayError(
           504,
           `Upstream request timed out after ${this.timeoutMs}ms`,
-          "api_error"
+          "api_error",
         )
       }
 
@@ -312,14 +363,14 @@ export class UpstreamOpenAIClient implements UpstreamClient {
         {
           ...logContext,
           durationMs,
-          networkError: details
+          networkError: details,
         },
-        "Upstream provider request failed"
+        "Upstream provider request failed",
       )
       throw new GatewayError(
         502,
         `Upstream request failed: ${failureDescription}`,
-        "api_error"
+        "api_error",
       )
     } finally {
       clearTimeout(timeout)
@@ -331,49 +382,91 @@ export class UpstreamOpenAIClient implements UpstreamClient {
     const fallbackMessage = `Upstream error: ${response.status} ${response.statusText}`
     let message = fallbackMessage
     let errorCode: string | undefined
+    const decorate = (error: GatewayError): GatewayError => {
+      error.upstreamCode = errorCode
+      error.upstreamStatus = response.status
+      const retry = response.headers.get("retry-after")
+      if (retry) {
+        const parsed = /^\d+(\.\d+)?$/.test(retry)
+          ? Date.now() + Number(retry) * 1000
+          : Date.parse(retry)
+        if (Number.isFinite(parsed)) error.retryAt = parsed
+      }
+      const reset =
+        response.headers.get("x-quota-reset") ||
+        response.headers.get("x-ratelimit-reset")
+      if (reset) {
+        const parsed = /^\d+(\.\d+)?$/.test(reset)
+          ? Number(reset) * (Number(reset) < 1e12 ? 1000 : 1)
+          : Date.parse(reset)
+        if (Number.isFinite(parsed) && parsed > Date.now())
+          error.resetAt = parsed
+      }
+      return error
+    }
 
     try {
       const bodyText = await response.text()
       if (!bodyText) {
-        return new GatewayError(response.status, message)
+        return decorate(new GatewayError(response.status, message))
       }
 
       const parsed = JSON.parse(bodyText) as Record<string, unknown>
-      const errorBody = parsed.error as { message?: string; code?: string } | undefined
-      const extractedMessage = errorBody?.message ?? (parsed.message as string | undefined) ?? bodyText
+      const errorBody = parsed.error as
+        | { message?: string; code?: string }
+        | undefined
+      const extractedMessage =
+        errorBody?.message ??
+        (parsed.message as string | undefined) ??
+        (parsed.detail as string | undefined) ??
+        bodyText
       if (typeof extractedMessage === "string") {
         message = extractedMessage
       }
       if (typeof errorBody?.code === "string") {
         errorCode = errorBody.code
+      } else if (typeof parsed.code === "string") {
+        errorCode = parsed.code
       }
     } catch {
       // Ignore parse failures and keep fallback message.
     }
 
-    const contextOverflowMessage = normalizeContextOverflowMessage(response.status, message, errorCode)
+    const contextOverflowMessage = normalizeContextOverflowMessage(
+      response.status,
+      message,
+      errorCode,
+    )
     if (contextOverflowMessage) {
-      return new GatewayError(400, contextOverflowMessage, "invalid_request_error")
+      return new GatewayError(
+        400,
+        contextOverflowMessage,
+        "invalid_request_error",
+      )
     }
 
     if (response.status === 429) {
-      return new GatewayError(429, message, "rate_limit_error")
+      return decorate(new GatewayError(429, message, "rate_limit_error"))
     }
     if (response.status === 401) {
-      return new GatewayError(401, message, "authentication_error")
+      return decorate(new GatewayError(401, message, "authentication_error"))
     }
     if (response.status === 413) {
-      return new GatewayError(413, message, "request_too_large")
+      return decorate(new GatewayError(413, message, "request_too_large"))
     }
     if (response.status >= 400 && response.status < 500) {
-      return new GatewayError(response.status, message, "invalid_request_error")
+      return decorate(
+        new GatewayError(response.status, message, "invalid_request_error"),
+      )
     }
-    return new GatewayError(502, message, "api_error")
+    return decorate(new GatewayError(502, message, "api_error"))
   }
 
-  private defaultHeaders(headers: Record<string, string>): Record<string, string> {
+  private defaultHeaders(
+    headers: Record<string, string>,
+  ): Record<string, string> {
     const baseHeaders: Record<string, string> = {
-      ...headers
+      ...headers,
     }
 
     if (this.apiKey) {

@@ -157,7 +157,7 @@ export class OpenAIStreamToAnthropic {
         this.usage.cacheReadInputTokens = normalized.cacheReadInputTokens
         this.usage.cacheCreationInputTokens = normalized.cacheCreationInputTokens
       }
-      if (typeof chunk.usage.completion_tokens === "number" && chunk.usage.completion_tokens > 0) {
+      if (typeof chunk.usage.completion_tokens === "number" && chunk.usage.completion_tokens >= 0) {
         this.completionUsageReported = true
         this.usage.outputTokens = normalized.outputTokens
       }

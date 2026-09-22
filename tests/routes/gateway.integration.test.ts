@@ -77,6 +77,35 @@ describe("gateway routes", () => {
     appsToClose = []
   })
 
+  it("exposes authenticated benchmark capabilities without requesting a model", async () => {
+    const app = createApp(baseConfig({ gatewayApiKeys: ["benchmark-key"] }), {
+      upstreamClient: createStubClient()
+    })
+    appsToClose.push(app)
+
+    const unauthenticated = await app.inject({
+      method: "GET",
+      url: "/v1/eval-capabilities"
+    })
+    expect(unauthenticated.statusCode).toBe(401)
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/eval-capabilities",
+      headers: { "x-api-key": "benchmark-key" }
+    })
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual({
+      version: 1,
+      forcedModel: null,
+      aliases: { "claude-sonnet-4-5": "gpt-4o-mini" },
+      streamCompletionChecks: true,
+      structuredErrors: true
+    })
+    expect(response.body).not.toContain("upstream-key")
+    expect(response.body).not.toContain("benchmark-key")
+  })
+
   it("handles non-streaming /v1/messages", async () => {
     const app = createApp(baseConfig(), { upstreamClient: createStubClient() })
     appsToClose.push(app)

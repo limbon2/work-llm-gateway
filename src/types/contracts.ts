@@ -1,6 +1,10 @@
 export type AnthropicRole = "user" | "assistant"
 
-export type AnthropicStopReason = "end_turn" | "max_tokens" | "tool_use" | "stop_sequence"
+export type AnthropicStopReason =
+  | "end_turn"
+  | "max_tokens"
+  | "tool_use"
+  | "stop_sequence"
 
 export interface AnthropicTextBlock {
   type: "text"
@@ -111,6 +115,10 @@ export interface AnthropicErrorResponse {
   error: {
     type: string
     message: string
+    code?: string
+    retry_at?: number
+    reset_at?: number
+    upstream_status?: number
   }
 }
 
@@ -126,7 +134,9 @@ export interface OpenAIImagePart {
   }
 }
 
-export type OpenAIMessageContent = string | Array<OpenAITextPart | OpenAIImagePart>
+export type OpenAIMessageContent =
+  | string
+  | Array<OpenAITextPart | OpenAIImagePart>
 
 export interface OpenAIToolCall {
   id: string
